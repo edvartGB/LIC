@@ -1,0 +1,134 @@
+#pragma kernel CSMain
+#define white float4(1.0, 1.0, 1.0, 1.0)
+#define black float4(0.0, 0.0, 0.0, .0)
+#define red float4(1.0, 0.0, 0.0, 1.0)
+#define green float4(0.0, 1.0, 0.0, 1.0)
+#define blue float4(0.0, 0.0, 1.0, 1.0)
+
+Texture2D<float3> uTex;
+Texture2D<float3> vTex;
+Texture2D<float3> noiseTex;
+Texture2D<float3> maskTex; 
+Texture2D<float3> colorMapTex; 
+RWTexture2D<float4> resultTex;
+SamplerState linearClampSampler;
+SamplerState pointClampSampler;
+
+float minU;
+float maxU;
+float minV;
+float maxV;
+float minMag;
+float maxMag;
+float maxMagnitude;
+float resX;
+float resY;
+bool isabelIndexing;
+bool RK4;
+
+float arc_length;
+float step_size;
+float sigma;
+float contrastAlpha;
+float contrastBeta;
+
+float unNormalize(float val, float min, float max){
+    return val*(max-min) + min;
+}
+
+float2 getVelocity(float2 pos) {
+    float2 velocity;
+    velocity.x = uTex.SampleLevel(linearClampSampler, float2(pos.x / resX, pos.y / resY), 0).r;
+    velocity.y = vTex.SampleLevel(linearClampSampler, float2(pos.x / resX, pos.y / resY), 0).r;
+
+    if (isabelIndexing) {
+        velocity.x = 1.0 - velocity.x;
+        velocity = velocity.yx;
+    } else {
+        velocity.y = 1.0 - velocity.y;
+    }
+
+    velocity.x = unNormalize(velocity.x, minU, maxU);
+    velocity.y = unNormalize(velocity.y, minV, maxV);
+    return velocity;
+}
+
+
+
+[numthreads(8, 8, 1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+    float2 uv = float2(id.x/resX, id.y/resY);
+
+    float F = noiseTex.SampleLevel(linearClampSampler, uv, 0).r;
+
+    int l = int(arc_length/step_size);
+    float kernelSize = 1;
+    float sign = 1.0;
+
+    for (int j = 0; j < 2; j++){
+        float posX = float(id.x);
+        float posY = float(id.y);
+    
+        for (int k = 0; k < l - 1; k++) {
+            float2 p = float2(posX, posY);
+            float2 velocity;
+            
+            if (RK4){
+                float2 k1 = getVelocity(p);
+                float2 k2 = getVelocity(p + sign * 0.5 * step_size * k1/length(k1));
+                float2 k3 = getVelocity(p + sign * 0.5 * step_size * k2/length(k2));
+                float2 k4 = getVelocity(p + sign * step_size * k3/length(k3));
+                velocity = (k1 + 2.0 * k2 + 2.0 * k3 + k4) / 6.0;
+            } else {
+                velocity = getVelocity(p);
+            }
+
+            
+            float magnitude = length(velocity);
+            
+            float dtx = step_size * velocity.x / magnitude;
+            float dty = step_size * velocity.y / magnitude;
+            
+            posX = posX + sign * dtx;
+            posY = posY + sign * dty;
+            
+            if ((posX < 0.0) || (posX > resX) || (posY < 0.0) || (posY > resY)) {
+                break;
+            }
+            
+            float x = k * step_size;
+            float kernelElement = exp((-x * x) / (sigma * sigma));
+            float noiseSample = noiseTex.SampleLevel(linearClampSampler, float2(posX / resX, posY / resY), 0).r;
+            F += kernelElement * noiseSample;
+            kernelSize += kernelElement;
+        }
+        sign = -1.0;
+    }
+
+    
+    float intensity = F / (kernelSize);
+    // apply contrast
+    intensity = contrastAlpha*(intensity-0.5) + 0.5 + contrastBeta;
+    intensity = pow(intensity, 2.0);
+    intensity = clamp(intensity, 0.0, 1.0); 
+    
+    
+    // do color mapping
+    float velUNorm = uTex.SampleLevel(linearClampSampler, uv, 0).r;
+    float velVNorm = vTex.SampleLevel(linearClampSampler, uv, 0).r; 
+    float velU = unNormalize(velUNorm, minU, maxU);
+    float velV = unNormalize(velVNorm, minV, maxV);
+    float magnitude = sqrt(velU*velU+velV*velV);
+    magnitude = (magnitude-minMag)/(minMag+maxMag);
+    
+    float3 color = colorMapTex.SampleLevel(linearClampSampler, float2(magnitude, 0.5), 0);
+    // resultTex[id.xy] = intensity*float4(color, 1.0);
+    resultTex[id.xy] = intensity*white;
+
+        
+    // mask out land
+    if (maskTex.SampleLevel(linearClampSampler, uv, 0).r < 0.5){
+        resultTex[id.xy] = black;
+    }
+}
